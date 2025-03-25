@@ -7,10 +7,20 @@ import {CrosschainFlashLoanToken} from "./CrosschainFlashLoanToken.sol";
 import {ISuperchainTokenBridge} from "@interop-lib/interfaces/ISuperchainTokenBridge.sol";
 import {IL2ToL2CrossDomainMessenger} from "@interop-lib/interfaces/IL2ToL2CrossDomainMessenger.sol";
 import {CrossDomainMessageLib} from "@interop-lib/libraries/CrossDomainMessageLib.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
 /// @title CrosschainFlashLoanBridge
 /// @notice A contract that facilitates cross-chain flash loans using FlashLoanVault
-contract CrosschainFlashLoanBridge {
+/// @dev This contract implements production-ready security features including reentrancy protection,
+/// pausable functionality, access control, rate limiting, and circuit breaker.
+contract CrosschainFlashLoanBridge is ReentrancyGuard, Pausable, AccessControl {
+    // Roles
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+
     // The token used for flash loans
     CrosschainFlashLoanToken public immutable token;
     // The vault on this chain
@@ -20,26 +30,68 @@ contract CrosschainFlashLoanBridge {
     // The messenger for cross-chain messages
     IL2ToL2CrossDomainMessenger public constant messenger =
         IL2ToL2CrossDomainMessenger(0x4200000000000000000000000000000000000023);
-    // Fee charged for cross-chain flash loans
+    
+    // Fee configuration
     uint256 public immutable flatFee;
-    // Owner who can withdraw fees
-    address public immutable owner;
-
+    uint256 public maxLoanAmount;
+    uint256 public minTimeBetweenLoans;
+    
+    // Rate limiting
+    mapping(address => uint256) public lastLoanTime;
+    
+    // Circuit breaker
+    bool public circuitBreaker;
+    
+    // Events
     event CrosschainFlashLoanInitiated(
-        uint256 indexed destinationChain, address indexed borrower, uint256 amount, uint256 fee
+        uint256 indexed destinationChain, 
+        address indexed borrower, 
+        uint256 amount, 
+        uint256 fee
     );
+    event CrosschainFlashLoanCompleted(
+        uint256 indexed sourceChain, 
+        address indexed borrower, 
+        uint256 amount
+    );
+    event CircuitBreakerSet(bool active);
+    event MaxLoanAmountUpdated(uint256 newAmount);
+    event MinTimeBetweenLoansUpdated(uint256 newTime);
+    event FeeUpdated(uint256 newFee);
 
-    event CrosschainFlashLoanCompleted(uint256 indexed sourceChain, address indexed borrower, uint256 amount);
-
+    // Errors
     error InsufficientFee();
     error TransferFailed();
     error CallFailed();
+    error CircuitBreakerActive();
+    error AmountExceedsMaximum();
+    error RateLimitExceeded();
+    error InvalidParameters();
+    error UnauthorizedAccess();
 
-    constructor(address _token, address _vault, uint256 _flatFee, address _owner) {
+    constructor(
+        address _token, 
+        address _vault, 
+        uint256 _flatFee, 
+        address _admin,
+        uint256 _maxLoanAmount,
+        uint256 _minTimeBetweenLoans
+    ) {
+        if (_token == address(0) || _vault == address(0) || _admin == address(0)) {
+            revert InvalidParameters();
+        }
+        
         token = CrosschainFlashLoanToken(_token);
         vault = FlashLoanVault(_vault);
         flatFee = _flatFee;
-        owner = _owner;
+        maxLoanAmount = _maxLoanAmount;
+        minTimeBetweenLoans = _minTimeBetweenLoans;
+
+        // Setup roles
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(ADMIN_ROLE, _admin);
+        _grantRole(OPERATOR_ROLE, _admin);
+        _grantRole(EMERGENCY_ROLE, _admin);
     }
 
     /// @notice Initiates a cross-chain flash loan
@@ -47,13 +99,29 @@ contract CrosschainFlashLoanBridge {
     /// @param amount The amount to borrow
     /// @param target The contract to call on the destination chain
     /// @param data The calldata to execute on the target contract
-    function initiateCrosschainFlashLoan(uint256 destinationChain, uint256 amount, address target, bytes calldata data)
-        external
-        payable
-        returns (bytes32)
-    {
-        // Check that sufficient fee was paid
+    function initiateCrosschainFlashLoan(
+        uint256 destinationChain, 
+        uint256 amount, 
+        address target, 
+        bytes calldata data
+    ) external payable whenNotPaused nonReentrant returns (bytes32) {
+        // Circuit breaker check
+        if (circuitBreaker) revert CircuitBreakerActive();
+        
+        // Input validation
+        if (amount == 0 || target == address(0)) revert InvalidParameters();
+        if (amount > maxLoanAmount) revert AmountExceedsMaximum();
+        
+        // Rate limiting
+        if (block.timestamp < lastLoanTime[msg.sender] + minTimeBetweenLoans) {
+            revert RateLimitExceeded();
+        }
+        
+        // Fee check
         if (msg.value < flatFee) revert InsufficientFee();
+
+        // Update rate limit
+        lastLoanTime[msg.sender] = block.timestamp;
 
         // Send tokens to destination chain
         bytes32 sendERC20MsgHash = bridge.sendERC20(address(token), address(this), amount, destinationChain);
@@ -74,12 +142,6 @@ contract CrosschainFlashLoanBridge {
     }
 
     /// @notice Executes the flash loan on the destination chain and returns tokens
-    /// @param sendERC20MsgHash The hash of the message responsible for sending the ERC20 tokens to the destination chain
-    /// @param sourceChain The chain ID where the flash loan was initiated
-    /// @param borrower The address that initiated the flash loan
-    /// @param amount The amount to borrow
-    /// @param target The contract to call with the borrowed funds
-    /// @param data The calldata to execute on the target contract
     function executeCrosschainFlashLoan(
         bytes32 sendERC20MsgHash,
         uint256 sourceChain,
@@ -87,12 +149,13 @@ contract CrosschainFlashLoanBridge {
         uint256 amount,
         address target,
         bytes memory data
-    ) external {
+    ) external whenNotPaused nonReentrant {
         CrossDomainMessageLib.requireCrossDomainCallback();
-        // CrossDomainMessageLib.requireMessageSuccess uses a special error signature that the
-        // auto-relayer performs special handling on. The auto-relayer parses the _sendWethMsgHash
-        // and waits for the _sendWethMsgHash to be relayed before relaying this message.
         CrossDomainMessageLib.requireMessageSuccess(sendERC20MsgHash);
+
+        // Input validation
+        if (amount == 0 || target == address(0)) revert InvalidParameters();
+        if (amount > maxLoanAmount) revert AmountExceedsMaximum();
 
         // give approval to the vault to transfer tokens
         token.approve(address(vault), amount);
@@ -106,7 +169,7 @@ contract CrosschainFlashLoanBridge {
         // Send tokens back to this contract on source chain
         bridge.sendERC20(
             address(token),
-            address(this), // Send back to this contract on source chain
+            address(this),
             amount,
             sourceChain
         );
@@ -114,10 +177,41 @@ contract CrosschainFlashLoanBridge {
         emit CrosschainFlashLoanCompleted(sourceChain, borrower, amount);
     }
 
-    /// @notice Allows owner to withdraw accumulated fees
-    function withdrawFees() external {
-        require(msg.sender == owner, "Not authorized");
-        (bool success,) = owner.call{value: address(this).balance}("");
+    // Admin functions
+
+    /// @notice Pause the contract
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /// @notice Set the circuit breaker state
+    function setCircuitBreaker(bool _active) external onlyRole(EMERGENCY_ROLE) {
+        circuitBreaker = _active;
+        emit CircuitBreakerSet(_active);
+    }
+
+    /// @notice Update the maximum loan amount
+    function setMaxLoanAmount(uint256 _amount) external onlyRole(ADMIN_ROLE) {
+        if (_amount == 0) revert InvalidParameters();
+        maxLoanAmount = _amount;
+        emit MaxLoanAmountUpdated(_amount);
+    }
+
+    /// @notice Update the minimum time between loans
+    function setMinTimeBetweenLoans(uint256 _time) external onlyRole(ADMIN_ROLE) {
+        if (_time == 0) revert InvalidParameters();
+        minTimeBetweenLoans = _time;
+        emit MinTimeBetweenLoansUpdated(_time);
+    }
+
+    /// @notice Withdraw accumulated fees
+    function withdrawFees() external onlyRole(ADMIN_ROLE) {
+        (bool success,) = msg.sender.call{value: address(this).balance}("");
         if (!success) revert TransferFailed();
     }
 }
